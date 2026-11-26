@@ -2,7 +2,10 @@ package hnsw
 
 import (
 	"cmp"
+	"fmt"
+	"math"
 	"math/rand"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -153,11 +156,25 @@ func TestGraph_AddDelete(t *testing.T) {
 
 	postDeleteConnectivity := an.Connectivity()
 
-	// Connectivity should be the same for the lowest layer.
-	require.Equal(
+	// Connectivity should be (almost) the same for the lowest layer. It used
+	// to be asserted exactly equal, but that only held because edges to
+	// deleted nodes were left dangling and still counted towards the degree.
+	// Delete now purges them, so a small drop is expected and correct.
+	require.InDelta(
 		t, preDeleteConnectivity[0],
 		postDeleteConnectivity[0],
+		0.5,
 	)
+
+	// No remaining node may point at a deleted node.
+	for li, l := range g.layers {
+		for k, node := range l.nodes {
+			for nk := range node.neighbors {
+				_, alive := l.nodes[nk]
+				require.True(t, alive, "layer %d: node %v has dangling edge to %v", li, k, nk)
+			}
+		}
+	}
 
 	t.Run("DeleteNotFound", func(t *testing.T) {
 		ok := g.Delete(-1)
@@ -305,4 +322,118 @@ func TestGraph_DeleteReplenishUsesGraphDistance(t *testing.T) {
 	require.Len(t, results, 1)
 	// Must be 9 or 11 (both distance 0.5 from 9.5).
 	require.Contains(t, []int{9, 11}, results[0].Key)
+}
+
+func randomVectors(n, dim int, seed int64) []Vector {
+	r := rand.New(rand.NewSource(seed))
+	out := make([]Vector, n)
+	for i := range out {
+		v := make(Vector, dim)
+		var sum float64
+		for j := range v {
+			x := r.NormFloat64()
+			v[j] = float32(x)
+			sum += x * x
+		}
+		norm := float32(1 / math.Sqrt(sum))
+		for j := range v {
+			v[j] *= norm
+		}
+		out[i] = v
+	}
+	return out
+}
+
+func bruteTopK(keys []string, vecs []Vector, q Vector, k int) []string {
+	idx := make([]int, len(keys))
+	for i := range idx {
+		idx[i] = i
+	}
+	slices.SortFunc(idx, func(a, b int) int {
+		return cmp.Compare(CosineDistance(vecs[a], q), CosineDistance(vecs[b], q))
+	})
+	out := make([]string, k)
+	for i := range out {
+		out[i] = keys[idx[i]]
+	}
+	return out
+}
+
+// Building twice from the same input must produce identical search results,
+// regardless of Go map iteration order.
+func TestGraph_Deterministic(t *testing.T) {
+	const n, dim = 400, 64
+	vecs := randomVectors(n, dim, 1)
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%04d", i)
+	}
+	build := func() *Graph[string] {
+		g := NewGraph[string]()
+		for i := range keys {
+			g.Add(MakeNode(keys[i], vecs[i]))
+		}
+		return g
+	}
+	queries := randomVectors(50, dim, 2)
+	first := build()
+	for round := 0; round < 5; round++ {
+		g := build()
+		for qi, q := range queries {
+			a, b := first.Search(q, 10), g.Search(q, 10)
+			require.Equal(t, len(a), len(b))
+			for i := range a {
+				require.Equal(t, a[i].Key, b[i].Key, "round %d query %d rank %d", round, qi, i)
+			}
+		}
+	}
+}
+
+// A graph over a few hundred vectors must find the true nearest neighbours
+// almost always. Uniform Gaussian vectors are a hard case (all distances are
+// close), so a larger EfSearch than the default is used here.
+func TestGraph_Recall(t *testing.T) {
+	const n, dim, k = 500, 64, 5
+	vecs := randomVectors(n, dim, 3)
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%04d", i)
+	}
+	g := NewGraph[string]()
+	g.EfSearch = 100
+	for i := range keys {
+		g.Add(MakeNode(keys[i], vecs[i]))
+	}
+	hit, total := 0, 0
+	for _, q := range randomVectors(100, dim, 4) {
+		want := map[string]bool{}
+		for _, w := range bruteTopK(keys, vecs, q, k) {
+			want[w] = true
+		}
+		for _, got := range g.Search(q, k) {
+			if want[got.Key] {
+				hit++
+			}
+		}
+		total += k
+	}
+	recall := float64(hit) / float64(total)
+	require.GreaterOrEqual(t, recall, 0.99, "recall@%d = %.3f", k, recall)
+
+	// Every stored vector must find itself.
+	for i := range keys {
+		res := g.Search(vecs[i], 1)
+		require.NotEmpty(t, res)
+		require.Equal(t, keys[i], res[0].Key)
+	}
+}
+
+func TestGraph_EntryIsSmallestKey(t *testing.T) {
+	l := &layer[string]{nodes: map[string]*layerNode[string]{}}
+	for _, k := range []string{"m", "b", "z", "a", "q"} {
+		l.nodes[k] = &layerNode[string]{Node: Node[string]{Key: k}}
+	}
+	for i := 0; i < 20; i++ {
+		require.Equal(t, "a", l.entry().Key)
+	}
 }

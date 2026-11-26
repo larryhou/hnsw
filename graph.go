@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/rand"
 	"slices"
-	"time"
 
 	"github.com/coder/hnsw/heap"
 	"golang.org/x/exp/maps"
@@ -34,9 +33,10 @@ type layerNode[K cmp.Ordered] struct {
 	neighbors map[K]*layerNode[K]
 }
 
-// addNeighbor adds a o neighbor to the node, replacing the neighbor
-// with the worst distance if the neighbor set is full.
-func (n *layerNode[K]) addNeighbor(newNode *layerNode[K], m int, dist DistanceFunc) {
+// addNeighbor adds a neighbor to the node. When the neighbor set overflows,
+// one neighbor is dropped: with the heuristic (default) the set is re-selected
+// with selectNeighbors, otherwise the neighbor with the worst distance goes.
+func (n *layerNode[K]) addNeighbor(newNode *layerNode[K], m int, dist DistanceFunc, simple bool) {
 	if n.neighbors == nil {
 		n.neighbors = make(map[K]*layerNode[K], m)
 	}
@@ -46,7 +46,21 @@ func (n *layerNode[K]) addNeighbor(newNode *layerNode[K], m int, dist DistanceFu
 		return
 	}
 
-	// Find the neighbor with the worst distance.
+	var drop *layerNode[K]
+	if simple {
+		drop = n.worstNeighbor(dist)
+	} else {
+		drop = n.heuristicDrop(m, dist)
+	}
+
+	delete(n.neighbors, drop.Key)
+	// Delete backlink from the dropped neighbor.
+	delete(drop.neighbors, n.Key)
+	drop.replenish(m, dist, simple)
+}
+
+// worstNeighbor returns the neighbor farthest from n.
+func (n *layerNode[K]) worstNeighbor(dist DistanceFunc) *layerNode[K] {
 	var (
 		worstDist = float32(math.Inf(-1))
 		worst     *layerNode[K]
@@ -55,16 +69,88 @@ func (n *layerNode[K]) addNeighbor(newNode *layerNode[K], m int, dist DistanceFu
 		d := dist(neighbor.Value, n.Value)
 		// d > worstDist may always be false if the distance function
 		// returns NaN, e.g., when the embeddings are zero.
-		if d > worstDist || worst == nil {
+		// Ties are broken by the larger key so that the result does not
+		// depend on map iteration order.
+		if d > worstDist || worst == nil || (d == worstDist && neighbor.Key > worst.Key) {
 			worstDist = d
 			worst = neighbor
 		}
 	}
+	return worst
+}
 
-	delete(n.neighbors, worst.Key)
-	// Delete backlink from the worst neighbor.
-	delete(worst.neighbors, n.Key)
-	worst.replenish(m, dist)
+// heuristicDrop picks the neighbor to drop from an over-full neighbor set
+// (len == m+1) by running selectNeighbors over it and returning whichever
+// neighbor was not selected.
+func (n *layerNode[K]) heuristicDrop(m int, dist DistanceFunc) *layerNode[K] {
+	cands := make([]searchCandidate[K], 0, len(n.neighbors))
+	for _, nb := range n.neighbors {
+		cands = append(cands, searchCandidate[K]{node: nb, dist: dist(nb.Value, n.Value)})
+	}
+	sortCandidates(cands)
+	kept := make(map[K]struct{}, m)
+	for _, c := range selectNeighbors(cands, m, dist) {
+		kept[c.node.Key] = struct{}{}
+	}
+	for i := len(cands) - 1; i >= 0; i-- {
+		if _, ok := kept[cands[i].node.Key]; !ok {
+			return cands[i].node
+		}
+	}
+	// Unreachable when len(cands) > m; fall back to the farthest neighbor.
+	return n.worstNeighbor(dist)
+}
+
+// sortCandidates orders candidates by ascending distance, ties by key.
+func sortCandidates[K cmp.Ordered](c []searchCandidate[K]) {
+	slices.SortFunc(c, func(a, b searchCandidate[K]) int {
+		if a.dist < b.dist {
+			return -1
+		}
+		if a.dist > b.dist {
+			return 1
+		}
+		return cmp.Compare(a.node.Key, b.node.Key)
+	})
+}
+
+// selectNeighbors implements the neighbor-selection heuristic of the HNSW
+// paper (Algorithm 4, with keepPrunedConnections). cands must be sorted by
+// ascending distance to the base point. A candidate is kept only if it is
+// closer to the base point than to every neighbor already kept; this spreads
+// the edges across directions (and clusters) instead of piling them onto the
+// nearest cluster. Discarded candidates then top the set up to m in distance
+// order, so the node still ends up with m edges.
+func selectNeighbors[K cmp.Ordered](cands []searchCandidate[K], m int, dist DistanceFunc) []searchCandidate[K] {
+	if len(cands) <= m {
+		return cands
+	}
+	selected := make([]searchCandidate[K], 0, m)
+	var pruned []searchCandidate[K]
+	for _, c := range cands {
+		if len(selected) >= m {
+			break
+		}
+		good := true
+		for _, r := range selected {
+			if dist(c.node.Value, r.node.Value) < c.dist {
+				good = false
+				break
+			}
+		}
+		if good {
+			selected = append(selected, c)
+		} else {
+			pruned = append(pruned, c)
+		}
+	}
+	for _, p := range pruned {
+		if len(selected) >= m {
+			break
+		}
+		selected = append(selected, p)
+	}
+	return selected
 }
 
 type searchCandidate[K cmp.Ordered] struct {
@@ -164,7 +250,7 @@ func (n *layerNode[K]) search(
 	return res
 }
 
-func (n *layerNode[K]) replenish(m int, dist DistanceFunc) {
+func (n *layerNode[K]) replenish(m int, dist DistanceFunc, simple bool) {
 	if len(n.neighbors) >= m {
 		return
 	}
@@ -172,8 +258,12 @@ func (n *layerNode[K]) replenish(m int, dist DistanceFunc) {
 	// Restore connectivity by adding new neighbors.
 	// This is a naive implementation that could be improved by
 	// using a priority queue to find the best candidates.
-	for _, neighbor := range n.neighbors {
-		for key, candidate := range neighbor.neighbors {
+	//
+	// Both loops iterate in sorted key order so the result is deterministic.
+	for _, nk := range sortedKeys(n.neighbors) {
+		neighbor := n.neighbors[nk]
+		for _, key := range sortedKeys(neighbor.neighbors) {
+			candidate := neighbor.neighbors[key]
 			if _, ok := n.neighbors[key]; ok {
 				// do not add duplicates
 				continue
@@ -181,7 +271,7 @@ func (n *layerNode[K]) replenish(m int, dist DistanceFunc) {
 			if candidate == n {
 				continue
 			}
-			n.addNeighbor(candidate, m, dist)
+			n.addNeighbor(candidate, m, dist, simple)
 			if len(n.neighbors) >= m {
 				return
 			}
@@ -189,15 +279,22 @@ func (n *layerNode[K]) replenish(m int, dist DistanceFunc) {
 	}
 }
 
+// sortedKeys returns the keys of m in ascending order.
+func sortedKeys[K cmp.Ordered](m map[K]*layerNode[K]) []K {
+	keys := maps.Keys(m)
+	slices.Sort(keys)
+	return keys
+}
+
 // isolates remove the node from the graph by removing all connections
 // to neighbors.
-func (n *layerNode[K]) isolate(m int, dist DistanceFunc) {
+func (n *layerNode[K]) isolate(m int, dist DistanceFunc, simple bool) {
 	for _, neighbor := range n.neighbors {
 		delete(neighbor.neighbors, n.Key)
 	}
 
-	for _, neighbor := range n.neighbors {
-		neighbor.replenish(m, dist)
+	for _, k := range sortedKeys(n.neighbors) {
+		n.neighbors[k].replenish(m, dist, simple)
 	}
 }
 
@@ -211,10 +308,25 @@ type layer[K cmp.Ordered] struct {
 }
 
 // entry returns the entry node of the layer.
-// It doesn't matter which node is returned, even that the
-// entry node is consistent, so we just return the first node
-// in the map to avoid tracking extra state.
+// It is the node with the smallest key, so that the same set of nodes
+// always yields the same entry point regardless of map iteration order.
+// The scan is O(size), which is cheap for the upper layers where it
+// matters; use anyNode when any node will do.
 func (l *layer[K]) entry() *layerNode[K] {
+	if l == nil {
+		return nil
+	}
+	var best *layerNode[K]
+	for k, node := range l.nodes {
+		if best == nil || k < best.Key {
+			best = node
+		}
+	}
+	return best
+}
+
+// anyNode returns an arbitrary node of the layer in O(1).
+func (l *layer[K]) anyNode() *layerNode[K] {
 	if l == nil {
 		return nil
 	}
@@ -251,6 +363,12 @@ type Graph[K cmp.Ordered] struct {
 	// E.g., for Ml = 0.25, each layer is 1/4 the size of the previous layer.
 	Ml float64
 
+	// SimpleNeighbors selects the plain "keep the M nearest" neighbor policy
+	// instead of the paper's heuristic (Algorithm 4). The heuristic is the
+	// default: it keeps well-connected graphs on clustered data. The simple
+	// policy is cheaper to build.
+	SimpleNeighbors bool
+
 	// EfSearch is the number of nodes to consider in the search phase.
 	// 20 is a reasonable default. Higher values improve search accuracy at
 	// the expense of memory.
@@ -260,8 +378,13 @@ type Graph[K cmp.Ordered] struct {
 	layers []*layer[K]
 }
 
+// defaultSeed is the fixed seed used by NewGraph so that building a graph
+// from the same input sequence yields the same graph. Callers that want
+// randomised levels can set Graph.Rng themselves.
+const defaultSeed = 1
+
 func defaultRand() *rand.Rand {
-	return rand.New(rand.NewSource(time.Now().UnixNano()))
+	return rand.New(rand.NewSource(defaultSeed))
 }
 
 // NewGraph returns a new graph with default parameters, roughly designed for
@@ -336,7 +459,7 @@ func (g *Graph[K]) Dims() int {
 	if len(g.layers) == 0 {
 		return 0
 	}
-	return len(g.layers[0].entry().Value)
+	return len(g.layers[0].anyNode().Value)
 }
 
 func ptr[T any](v T) *T {
@@ -376,26 +499,34 @@ func (g *Graph[K]) Add(nodes ...Node[K]) {
 			}
 
 			// Insert the new node into the layer.
-			if layer.entry() == nil {
+			if layer.anyNode() == nil {
 				layer.nodes = map[K]*layerNode[K]{key: newNode}
 				continue
 			}
 
 			// Now at the highest layer with more than one node, so we can begin
 			// searching for the best way to enter the graph.
-			searchPoint := layer.entry()
-
 			// On subsequent layers, we use the elevator node to enter the graph
-			// at the best point.
+			// at the best point. Only the topmost layer needs entry(), and
+			// that layer is small, so the O(size) scan is cheap.
+			var searchPoint *layerNode[K]
 			if elevator != nil {
 				searchPoint = layer.nodes[*elevator]
+			} else {
+				searchPoint = layer.entry()
 			}
 
 			if g.Distance == nil {
 				panic("(*Graph).Distance must be set")
 			}
 
-			neighborhood := searchPoint.search(g.M, g.EfSearch, vec, g.Distance)
+			// Candidate pool: the heuristic needs more than M candidates to
+			// choose from; the simple policy only ever uses the M nearest.
+			k := g.M
+			if !g.SimpleNeighbors && g.EfSearch > k {
+				k = g.EfSearch
+			}
+			neighborhood := searchPoint.search(k, g.EfSearch, vec, g.Distance)
 			if len(neighborhood) == 0 {
 				// This should never happen because the searchPoint itself
 				// should be in the result set.
@@ -405,6 +536,14 @@ func (g *Graph[K]) Add(nodes ...Node[K]) {
 			// Re-set the elevator node for the next layer.
 			elevator = ptr(neighborhood[0].node.Key)
 
+			if g.SimpleNeighbors {
+				if len(neighborhood) > g.M {
+					neighborhood = neighborhood[:g.M]
+				}
+			} else {
+				neighborhood = selectNeighbors(neighborhood, g.M, g.Distance)
+			}
+
 			if insertLevel >= i {
 				if _, ok := layer.nodes[key]; ok {
 					g.Delete(key)
@@ -413,15 +552,15 @@ func (g *Graph[K]) Add(nodes ...Node[K]) {
 				layer.nodes[key] = newNode
 				for _, node := range neighborhood {
 					// Create a bi-directional edge between the new node and the best node.
-					node.node.addNeighbor(newNode, g.M, g.Distance)
-					newNode.addNeighbor(node.node, g.M, g.Distance)
+					node.node.addNeighbor(newNode, g.M, g.Distance, g.SimpleNeighbors)
+					newNode.addNeighbor(node.node, g.M, g.Distance, g.SimpleNeighbors)
 				}
 			}
 		}
 
 		// Invariant check: the node should have been added to the graph.
 		if g.Len() != preLen+1 {
-			if len(g.layers) > 0 && g.layers[len(g.layers)-1].entry() == nil {
+			if len(g.layers) > 0 && g.layers[len(g.layers)-1].anyNode() == nil {
 				g.layers = g.layers[:len(g.layers)-1]
 			}
 		}
@@ -462,9 +601,11 @@ func (h *Graph[K]) search(near Vector, k int) []SearchResult[K] {
 	)
 
 	for layer := len(h.layers) - 1; layer >= 0; layer-- {
-		searchPoint := h.layers[layer].entry()
+		var searchPoint *layerNode[K]
 		if elevator != nil {
 			searchPoint = h.layers[layer].nodes[*elevator]
+		} else {
+			searchPoint = h.layers[layer].entry()
 		}
 
 		// Descending hierarchies
@@ -517,7 +658,15 @@ func (h *Graph[K]) Delete(key K) bool {
 		if len(layer.nodes) == 0 {
 			deleteLayer[i] = struct{}{}
 		}
-		node.isolate(h.M, h.Distance)
+		// Edges are not guaranteed to be symmetric (replenish and the
+		// over-capacity drop only touch one side), so other nodes may still
+		// point at the deleted node even though it does not point back.
+		// Purge those before replenishing, or searches could walk into a
+		// node that is no longer in the graph.
+		for _, other := range layer.nodes {
+			delete(other.neighbors, key)
+		}
+		node.isolate(h.M, h.Distance, h.SimpleNeighbors)
 		deleted = true
 	}
 
