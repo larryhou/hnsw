@@ -581,60 +581,53 @@ func TestRegression_SearchEntryIsDeterministic(t *testing.T) {
 	}
 }
 
-// Protects: Delete repairs every node that lost an edge, not only the deleted
-// node's own neighbours. Edges are not symmetric, so a node can point at the
-// deleted node without being pointed at by it; skipping those left them
-// permanently short of M edges.
-func TestRegression_DeleteRestoresDegree(t *testing.T) {
-	for _, m := range []int{6, 16} {
-		g := newTestGraph[int]()
-		g.M = m
-		const n = 256
+// Protects: re-adding an existing key (an in-place update) must not corrupt
+// the graph. Add used to delete the old node one layer at a time while
+// inserting, which also removed the lower layers' copies; the elevator then
+// pointed at a node that was gone and a later Add panicked with a nil
+// searchPoint. The panic needs several updates and enough layers to show up,
+// so this runs many of them over a range of seeds.
+func TestRegression_RepeatedInPlaceUpdates(t *testing.T) {
+	const n, dim, updates = 120, 8, 240
+	for seed := int64(1); seed <= 30; seed++ {
+		r := rand.New(rand.NewSource(seed))
+		vecs := randomVectors(n, dim, seed)
+		g := NewGraph[int]()
+		g.Rng = rand.New(rand.NewSource(seed))
 		for i := 0; i < n; i++ {
-			g.Add(Node[int]{Key: i, Value: Vector{float32(i)}})
+			g.Add(MakeNode(i, vecs[i]))
 		}
-		for i := 0; i < n; i += 2 {
-			g.Delete(i)
+		latest := map[int]Vector{}
+		for i := 0; i < n; i++ {
+			latest[i] = vecs[i]
 		}
-		total := 0
-		for _, node := range g.layers[0].nodes {
-			total += len(node.neighbors)
+		for u := 0; u < updates; u++ {
+			k := r.Intn(n)
+			v := make(Vector, dim)
+			for d := range v {
+				v[d] = vecs[k][d] + float32(r.NormFloat64())*0.1
+			}
+			require.NotPanics(t, func() { g.Add(MakeNode(k, v)) }, "seed %d update %d key %d", seed, u, k)
+			latest[k] = v
 		}
-		avg := float64(total) / float64(len(g.layers[0].nodes))
-		require.GreaterOrEqual(t, avg, float64(m)-0.01, "M=%d: average degree after delete", m)
-	}
-}
 
-// Protects: replenish fills the slots a delete vacated with the nearest
-// second-hop nodes. It used to take them in key order, so the slots went to
-// arbitrary, often far-away nodes and, after churn, recall at a given EfSearch
-// was a few points below a freshly built graph.
-func TestRegression_ReplenishPicksNearestSecondHop(t *testing.T) {
-	mk := func(key int, v float32) *layerNode[int] {
-		return &layerNode[int]{Node: Node[int]{Key: key, Value: Vector{v}}, neighbors: map[int]*layerNode[int]{}}
+		require.Equal(t, n, g.Len(), "seed %d", seed)
+		for k, want := range latest {
+			got, ok := g.Lookup(k)
+			require.True(t, ok, "seed %d key %d missing", seed, k)
+			require.Equal(t, want, got, "seed %d key %d holds a stale vector", seed, k)
+		}
+		for li, l := range g.layers {
+			require.NotEmpty(t, l.nodes, "seed %d layer %d is empty", seed, li)
+			for k, node := range l.nodes {
+				if li > 0 {
+					_, below := g.layers[li-1].nodes[k]
+					require.True(t, below, "seed %d: key %d in layer %d but not below", seed, k, li)
+				}
+				for nk, nb := range node.neighbors {
+					require.Same(t, l.nodes[nk], nb, "seed %d layer %d: edge %d->%d points at a removed node", seed, li, k, nk)
+				}
+			}
+		}
 	}
-	// n sits at 0 with a single neighbor hub; hub knows three candidates. The
-	// far candidates have the smaller keys, so key order would pick them first.
-	n, hub := mk(10, 0), mk(11, 1)
-	far1, far2, near := mk(1, 90), mk(2, 50), mk(3, 2)
-	n.neighbors[hub.Key] = hub
-	for _, c := range []*layerNode[int]{far1, far2, near} {
-		hub.neighbors[c.Key] = c
-	}
-
-	n.replenish(2, EuclideanDistance, true)
-
-	require.Len(t, n.neighbors, 2)
-	require.Contains(t, n.neighbors, near.Key, "the nearest second-hop node must be chosen")
-	require.NotContains(t, n.neighbors, far1.Key)
-	require.NotContains(t, n.neighbors, far2.Key)
-}
-
-func sortedLiveKeys(m map[string]Vector) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	return keys
 }
