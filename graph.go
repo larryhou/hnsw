@@ -466,6 +466,13 @@ func ptr[T any](v T) *T {
 	return &v
 }
 
+// replaceEfFactor scales the search width used when Add replaces an existing
+// key (an in-place update). With a plain EfSearch-wide search, recall after
+// repeated updates falls well below a graph built from scratch from the same
+// data; a 4x wider search on the update path recovers most of that gap while
+// leaving first-time inserts at their usual cost.
+const replaceEfFactor = 4
+
 // Add inserts nodes into the graph.
 // If another node with the same ID exists, it is replaced.
 func (g *Graph[K]) Add(nodes ...Node[K]) {
@@ -481,7 +488,7 @@ func (g *Graph[K]) Add(nodes ...Node[K]) {
 		// at a node that is no longer there. Delete may also drop layers that
 		// become empty, so it has to run before the layers for this insert
 		// are created.
-		g.Delete(key)
+		replaced := g.Delete(key)
 
 		insertLevel := g.randomLevel()
 		// Create layers that don't exist yet.
@@ -535,7 +542,19 @@ func (g *Graph[K]) Add(nodes ...Node[K]) {
 			if !g.SimpleNeighbors && g.EfSearch > k {
 				k = g.EfSearch
 			}
-			neighborhood := searchPoint.search(k, g.EfSearch, vec, g.Distance)
+			efBuild := g.EfSearch
+			if replaced && !g.SimpleNeighbors {
+				// An updated node is re-inserted into a graph that has
+				// already been shaped around its old position, and the
+				// graph does not repair itself when nodes move, so a
+				// wider search is needed to find good neighbors for it.
+				// See replaceEfFactor.
+				efBuild = g.EfSearch * replaceEfFactor
+				if efBuild > k {
+					k = efBuild
+				}
+			}
+			neighborhood := searchPoint.search(k, efBuild, vec, g.Distance)
 			if len(neighborhood) == 0 {
 				// This should never happen because the searchPoint itself
 				// should be in the result set.

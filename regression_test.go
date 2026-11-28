@@ -631,3 +631,43 @@ func TestRegression_RepeatedInPlaceUpdates(t *testing.T) {
 		}
 	}
 }
+
+// Protects: updating a key in place keeps recall close to a graph built from
+// scratch from the same data. Before replaceEfFactor, re-adding a key searched
+// only EfSearch wide, and after several rounds of updates recall at a given
+// EfSearch sat 4-7 points below a fresh build.
+func TestRegression_RecallAfterInPlaceUpdates(t *testing.T) {
+	const n, dim, k, ef, rounds = 1000, 64, 10, 20, 8
+	r := rand.New(rand.NewSource(3))
+	vecs := randomVectors(n, dim, 3)
+	keys := seqKeys(n)
+
+	g := NewGraph[string]()
+	g.EfSearch = ef
+	cur := append([]Vector(nil), vecs...)
+	for i := range keys {
+		g.Add(MakeNode(keys[i], cur[i]))
+	}
+	for round := 0; round < rounds; round++ {
+		for i := range keys {
+			if r.Float64() >= 0.3 {
+				continue
+			}
+			v := make(Vector, dim)
+			for d := range v {
+				v[d] = cur[i][d] + float32(r.NormFloat64())*0.08
+			}
+			cur[i] = v
+			g.Add(MakeNode(keys[i], v))
+		}
+	}
+	require.Equal(t, n, g.Len())
+
+	fresh := buildGraph(keys, cur, func(g *Graph[string]) { g.EfSearch = ef })
+	queries := randomVectors(150, dim, 503)
+	updated := recallAt(g, keys, cur, queries, k)
+	base := recallAt(fresh, keys, cur, queries, k)
+	t.Logf("recall@%d updated=%.3f fresh=%.3f", k, updated, base)
+	require.GreaterOrEqual(t, updated, base-0.03,
+		"recall after in-place updates %.3f is far below a fresh build %.3f", updated, base)
+}
