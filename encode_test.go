@@ -178,6 +178,44 @@ func TestSavedGraph(t *testing.T) {
 	requireGraphApproxEquals(t, g1.Graph, g2.Graph)
 }
 
+// A serialized graph may hold a neighbor key with no node in its layer (e.g.
+// exported by an older version before dangling edges were purged on Delete).
+// Import must drop such keys rather than store a nil neighbor that a later
+// Search or Add would dereference.
+func TestGraph_ImportDropsDanglingNeighbor(t *testing.T) {
+	g := newTestGraph[int]()
+	for i := 0; i < 8; i++ {
+		g.Add(Node[int]{i, randFloats(1)})
+	}
+
+	const ghost = -1
+	var victim int
+	for key, node := range g.layers[0].nodes {
+		node.neighbors[ghost] = node
+		victim = key
+		break
+	}
+
+	buf := &bytes.Buffer{}
+	require.NoError(t, g.Export(buf))
+
+	g2 := &Graph[int]{}
+	require.NoError(t, g2.Import(buf))
+
+	_, survived := g2.layers[0].nodes[victim].neighbors[ghost]
+	require.False(t, survived, "dangling neighbor key survived import")
+	for _, l := range g2.layers {
+		for key, node := range l.nodes {
+			for nKey, n := range node.neighbors {
+				require.NotNilf(t, n, "node %v has nil neighbor %v after import", key, nKey)
+			}
+		}
+	}
+
+	require.NotPanics(t, func() { _ = g2.Search([]float32{0.5}, 5) })
+	verifyGraphNodes(t, g2)
+}
+
 const benchGraphSize = 100
 
 func BenchmarkGraph_Import(b *testing.B) {

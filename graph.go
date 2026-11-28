@@ -255,26 +255,45 @@ func (n *layerNode[K]) replenish(m int, dist DistanceFunc, simple bool) {
 		return
 	}
 
-	// Restore connectivity by adding new neighbors.
-	// This is a naive implementation that could be improved by
-	// using a priority queue to find the best candidates.
+	// Restore connectivity from the nearest second-hop nodes (neighbors of
+	// neighbors). Candidates are ranked by distance to n, ties by key, so the
+	// result is deterministic. Visiting them in key order instead would fill
+	// the vacated slots with arbitrary, often far-away nodes.
 	//
-	// Both loops iterate in sorted key order so the result is deterministic.
-	for _, nk := range sortedKeys(n.neighbors) {
-		neighbor := n.neighbors[nk]
-		for _, key := range sortedKeys(neighbor.neighbors) {
-			candidate := neighbor.neighbors[key]
-			if _, ok := n.neighbors[key]; ok {
-				// do not add duplicates
-				continue
+	// Harvesting from every neighbor costs a distance per neighbor-of-neighbor
+	// (~200 at M=16) to fill a slot or two, so start with only the nearest few
+	// neighbors and widen to all of them if that cannot fill the node to m.
+	need := m - len(n.neighbors)
+	seen := make(map[K]struct{}, m*m)
+	var cands []searchCandidate[K]
+	harvest := func(keys []K) {
+		for _, nk := range keys {
+			for key, candidate := range n.neighbors[nk].neighbors {
+				if candidate == n {
+					continue
+				}
+				if _, ok := n.neighbors[key]; ok {
+					// do not add duplicates
+					continue
+				}
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				cands = append(cands, searchCandidate[K]{node: candidate, dist: dist(candidate.Value, n.Value)})
 			}
-			if candidate == n {
-				continue
-			}
-			n.addNeighbor(candidate, m, dist, simple)
-			if len(n.neighbors) >= m {
-				return
-			}
+		}
+	}
+	nearest := n.nearestNeighborKeys(replenishNearest, dist)
+	harvest(nearest)
+	if len(cands) < need && len(nearest) < len(n.neighbors) {
+		harvest(sortedKeys(n.neighbors))
+	}
+	sortCandidates(cands)
+	for _, c := range cands {
+		n.addNeighbor(c.node, m, dist, simple)
+		if len(n.neighbors) >= m {
+			return
 		}
 	}
 }
@@ -284,18 +303,6 @@ func sortedKeys[K cmp.Ordered](m map[K]*layerNode[K]) []K {
 	keys := maps.Keys(m)
 	slices.Sort(keys)
 	return keys
-}
-
-// isolates remove the node from the graph by removing all connections
-// to neighbors.
-func (n *layerNode[K]) isolate(m int, dist DistanceFunc, simple bool) {
-	for _, neighbor := range n.neighbors {
-		delete(neighbor.neighbors, n.Key)
-	}
-
-	for _, k := range sortedKeys(n.neighbors) {
-		n.neighbors[k].replenish(m, dist, simple)
-	}
 }
 
 type layer[K cmp.Ordered] struct {
@@ -663,10 +670,18 @@ func (h *Graph[K]) Delete(key K) bool {
 		// point at the deleted node even though it does not point back.
 		// Purge those before replenishing, or searches could walk into a
 		// node that is no longer in the graph.
+		var affected []*layerNode[K]
 		for _, other := range layer.nodes {
-			delete(other.neighbors, key)
+			if _, ok := other.neighbors[key]; ok {
+				delete(other.neighbors, key)
+				affected = append(affected, other)
+			}
 		}
-		node.isolate(h.M, h.Distance, h.SimpleNeighbors)
+		slices.SortFunc(affected, func(a, b *layerNode[K]) int { return cmp.Compare(a.Key, b.Key) })
+		node.neighbors = nil
+		for _, other := range affected {
+			other.replenish(h.M, h.Distance, h.SimpleNeighbors)
+		}
 		deleted = true
 	}
 
@@ -696,4 +711,32 @@ func (h *Graph[K]) Lookup(key K) (Vector, bool) {
 		return nil, false
 	}
 	return node.Value, ok
+}
+
+// replenishNearest is how many of a node's nearest neighbors replenish
+// harvests second-hop candidates from. Harvesting from all of them costs a
+// distance evaluation per neighbor-of-neighbor (~200 at M=16) to fill a slot
+// or two. The nearest few already hold the best replacements, which keeps
+// most of the recall gain at about half the cost of Delete.
+const replenishNearest = 4
+
+// nearestNeighborKeys returns the keys of the h neighbors closest to n, in
+// ascending (distance, key) order. With h >= len(neighbors) it returns all
+// keys in key order and computes no distances.
+func (n *layerNode[K]) nearestNeighborKeys(h int, dist DistanceFunc) []K {
+	keys := sortedKeys(n.neighbors)
+	if h >= len(keys) {
+		return keys
+	}
+	c := make([]searchCandidate[K], 0, len(keys))
+	for _, k := range keys {
+		nb := n.neighbors[k]
+		c = append(c, searchCandidate[K]{node: nb, dist: dist(nb.Value, n.Value)})
+	}
+	sortCandidates(c)
+	out := make([]K, h)
+	for i := range out {
+		out[i] = c[i].node.Key
+	}
+	return out
 }

@@ -248,10 +248,16 @@ func (h *Graph[K]) Import(r io.Reader) error {
 				node.neighbors[neighbor] = nil
 			}
 		}
-		// Fill in neighbor pointers
+		// Fill in neighbor pointers. A key with no node in this layer is a
+		// dangling edge (e.g. from a graph exported before Delete purged
+		// them); storing the nil lookup would panic on the next search.
 		for _, node := range nodes {
 			for key := range node.neighbors {
-				node.neighbors[key] = nodes[key]
+				if target := nodes[key]; target != nil {
+					node.neighbors[key] = target
+				} else {
+					delete(node.neighbors, key)
+				}
 			}
 		}
 		h.layers[i] = &layer[K]{nodes: nodes}
